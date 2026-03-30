@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 
 load_dotenv()
 
-
 groq_api_key = os.getenv("GROQ_API_KEY")
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_KEY")
@@ -40,6 +39,12 @@ class ChatRequest(BaseModel):
     booking_data: Optional[Any] = None
 
 # ============================================================
+# PAKISTAN TIME HELPER
+# ============================================================
+def pk_now():
+    return datetime.now(timezone.utc) + timedelta(hours=5)
+
+# ============================================================
 # SESSION HELPERS
 # ============================================================
 def session_load(session_id: str) -> dict:
@@ -58,7 +63,7 @@ def session_save(session_id: str, data: dict):
         supabase.table("sessions").upsert({
             "id": session_id,
             "data": data,
-            "updated_at": datetime.now().isoformat()
+            "updated_at": pk_now().isoformat()
         }).execute()
     except Exception as e:
         print("Session save error:", e)
@@ -102,7 +107,7 @@ def get_service_names(booking_data, barbers_list, services_list):
 # ============================================================
 def parse_flexible_date(text):
     text  = text.strip().lower()
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = pk_now().replace(hour=0, minute=0, second=0, microsecond=0)
     relative_list = [
         ("aaj ki", 0), ("aaj", 0), ("aj ki", 0), ("aj", 0),
         ("today", 0), ("abhi", 0), ("is waqt", 0), ("ag ki", 0), ("ag", 0),
@@ -126,18 +131,18 @@ def parse_flexible_date(text):
         m = re.search(rf'(\d{{1,2}})\s*{month_str}(?:\s+(\d{{4}}))?', text)
         if m:
             day=int(m.group(1)); year=int(m.group(2)) if m.group(2) else today.year
-            try: return datetime(year, month_num, day)
+            try: return datetime(year, month_num, day, tzinfo=timezone.utc) + timedelta(hours=5)
             except: pass
         m = re.search(rf'{month_str}\s+(\d{{1,2}})(?:\s+(\d{{4}}))?', text)
         if m:
             day=int(m.group(1)); year=int(m.group(2)) if m.group(2) else today.year
-            try: return datetime(year, month_num, day)
+            try: return datetime(year, month_num, day, tzinfo=timezone.utc) + timedelta(hours=5)
             except: pass
     m = re.search(r'(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})', text)
     if m:
         day,month,year=int(m.group(1)),int(m.group(2)),int(m.group(3))
         if year<100: year+=2000
-        try: return datetime(year,month,day)
+        try: return datetime(year,month,day,tzinfo=timezone.utc) + timedelta(hours=5)
         except: pass
     m = re.match(r'^(\d{1,2})$', text.strip())
     if m:
@@ -207,7 +212,7 @@ def parse_flexible_time(text):
     else:
         if 1<=hour<=9: hour+=12
     if not (0<=hour<=23) or not (0<=minute<=59): return None
-    try: return datetime.now().replace(hour=hour,minute=minute,second=0,microsecond=0)
+    try: return pk_now().replace(hour=hour,minute=minute,second=0,microsecond=0)
     except: return None
 
 # ============================================================
@@ -232,7 +237,7 @@ def parse_barber_timing(timing_str):
 # FRESH DATA
 # ============================================================
 def get_fresh_data():
-    now=datetime.now(timezone.utc) + timedelta(hours=5); today_name=now.strftime("%A"); today_date=now.strftime("%d %B %Y")
+    now=pk_now(); today_name=now.strftime("%A"); today_date=now.strftime("%d %B %Y")
     barbers_data=supabase.table("barbers").select("*").execute().data or []
     services_data=supabase.table("barber_services").select("*, barbers(name)").execute().data or []
     available_today=[]; off_today=[]; barber_details=[]
@@ -275,7 +280,9 @@ STRICT RULES:
 6. Agar user ek saath service + barber mention kare to confirm karo: "Haan [Barber] [Service] karta hai! Booking karwni hai?"
 7. Off-topic sawal = "Main sirf salon info ke liye hoon."
 8. Reply chhota rakho — sirf jawab, koi extra explanation nahi.
-9. Confident raho — "lekin", "shayad", "however" mat likho."""
+9. Confident raho — "lekin", "shayad", "however" mat likho.
+10. Barber ke off days sirf database se batao — apne aap calculate mat karo. Agar barber ka off day Monday hai to sirf Monday off hai, Tuesday nahi.
+11. "Kab available hoga" = sirf off days database se dekho, baaki sab din available hai."""
 
 # ============================================================
 # AI INTENT + EXTRACT
@@ -385,18 +392,14 @@ async def chat(req: ChatRequest):
     booking_step = session.get("booking_step", 0)
     booking_data = session.get("booking_data", {})
 
-    # ✅ KEY FIX: Frontend se aayi booking_data ko session data ke upar merge karo
-    # Sirf non-empty values se override karo
     if req.booking_data and isinstance(req.booking_data, dict):
         for k, v in req.booking_data.items():
             if v is not None and v != "" and v != {} and v != []:
                 booking_data[k] = v
 
-    # Step bhi frontend se lo agar session mein nahi hai
     if req.booking_step and not booking_step:
         booking_step = req.booking_step
 
-    # ✅ Step 3 ke liye — session step use karo (frontend se aata hai 3)
     if req.booking_step == 3:
         booking_step = 3
 
@@ -426,6 +429,11 @@ async def chat(req: ChatRequest):
             booking_data["phone"] = prompt
             if booking_data.get("service"):
                 step,rep=_resolve_after_service(booking_data,barbers_list,services_list)
+                # Agar barber+date+time sab hai to seedha confirm
+                if booking_data.get("barber") and booking_data.get("date") and booking_data.get("time") and step not in [2,4]:
+                    svc_display=booking_data.get("service","")
+                    rep=f"✅ Confirm karein:\n💈 Barber: **{booking_data['barber']}**\n✂️ Service: **{svc_display}**\n📅 Date: **{booking_data['date']}**\n⏰ Time: **{booking_data['time']}**\n\nSahi hai? (Haan/Nahi)"
+                    return ret(rep,7,booking_data)
                 svc_names=get_service_names(booking_data,barbers_list,services_list)
                 if step==2: return ret(rep,step,booking_data,{"show_services":svc_names})
                 return ret(rep,step,booking_data)
@@ -441,13 +449,11 @@ async def chat(req: ChatRequest):
             return ret(msg,2,booking_data,{"show_services":svc_names})
 
         elif booking_step == 3:
-            # ✅ Service ab booking_data mein already hai (frontend ne merge kiya)
             if not booking_data.get("service"):
                 svc_names=get_service_names(booking_data,barbers_list,services_list)
                 barber_name=booking_data.get("barber","")
                 msg=f"💇 **{barber_name}** ki services select karein:" if barber_name else "💇 Service select karein:"
                 return ret(msg,2,booking_data,{"show_services":svc_names})
-            # ✅ Session mein bhi save karo service ke saath
             session_save(session_id,{"booking_step":3,"booking_data":booking_data})
             step,rep=_resolve_after_service(booking_data,barbers_list,services_list)
             svc_names=get_service_names(booking_data,barbers_list,services_list)
@@ -469,9 +475,10 @@ async def chat(req: ChatRequest):
         elif booking_step == 6:
             parsed_date=parse_flexible_date(lower_prompt)
             if parsed_date is None: return ret("❌ Date samajh nahi aaya.\n• **kal**, **parson**\n• **15 march**, **20 april 2026**",6,booking_data)
-            if parsed_date.date()<datetime.now().date(): return ret(f"❌ Yeh date ({parsed_date.strftime('%d %B %Y')}) guzar chuki hai! Aaj ya aage ki date dein:",6,booking_data)
-            if parsed_date.date()>(datetime.now()+timedelta(days=7)).date():
-                max_d=(datetime.now()+timedelta(days=7)).strftime('%d %B %Y')
+            now_pk=pk_now()
+            if parsed_date.date()<now_pk.date(): return ret(f"❌ Yeh date ({parsed_date.strftime('%d %B %Y')}) guzar chuki hai! Aaj ya aage ki date dein:",6,booking_data)
+            if parsed_date.date()>(now_pk+timedelta(days=7)).date():
+                max_d=(now_pk+timedelta(days=7)).strftime('%d %B %Y')
                 return ret(f"❌ Sirf 7 din ke andar booking karein.\n✅ Maximum: **{max_d}**\n\nKoi aur date dein:",6,booking_data)
             chosen_day=parsed_date.strftime("%A")
             barber_row=next((b for b in barbers_list if b["name"].lower()==booking_data.get("barber","").lower()),None)
@@ -485,6 +492,13 @@ async def chat(req: ChatRequest):
             return ret(reply,7,booking_data)
 
         elif booking_step == 7:
+            # ✅ FIX: Pehle check karo "nahi" hai to booking cancel karo
+            no_words=["nahi","nai","no","nope","cancel","band","rok","galat","ghalat"]
+            is_no=any(w in lower_prompt.split() for w in no_words)
+            if is_no:
+                session_clear(session_id)
+                return {"reply":"❌ Booking cancel ho gayi. Koi aur madad chahiye?","booking_step":0,"booking_data":{},"session_id":session_id}
+
             yes_words=["haan","han","yes","hna","ok","okay","bilkul","sahi","theek","confirm"]
             is_confirm=any(w in lower_prompt.split() for w in yes_words)
             if is_confirm and booking_data.get("time"):
@@ -542,7 +556,7 @@ async def chat(req: ChatRequest):
                 nts=f"{nh%12 or 12}:{nm:02d} {'AM' if nh<12 else 'PM'}"
                 return ret(f"❌ Yeh slot ({user_time.strftime('%I:%M %p')}) already book hai!\n\n💡 Agla available: **{nts}**\n\nKoi aur time likhiye:",7,booking_data)
             booking_data["time"]=user_time.strftime("%I:%M %p")
-            if not booking_data.get("date"): booking_data["date"]=datetime.now().strftime("%d %B %Y")
+            if not booking_data.get("date"): booking_data["date"]=pk_now().strftime("%d %B %Y")
             try: ok,reply=save_booking_to_db(booking_data,barbers_list)
             except Exception as e: reply=f"❌ Error: {str(e)}"
             session_clear(session_id)
@@ -552,14 +566,72 @@ async def chat(req: ChatRequest):
     # NORMAL FLOW
     # ============================================================
     else:
+        # FIX 1: Greeting hardcoded
+        greeting_words = ["kia hal", "kaise ho", "kia haal", "hal chal", "kesy ho", "kese ho", "how are you", "kaisa hai", "kaisy ho"]
+        if any(w in lower_prompt for w in greeting_words):
+            return {"reply": "Theek hoon! Kya madad karun?", "booking_step": 0, "booking_data": {}, "session_id": session_id}
+
+        # FIX 2: Cheapest barber hardcoded
+        cheapest_words = ["sasta", "sasti", "cheap", "kam price", "sab sa sasta", "sabse sasta", "sab se sasta", "sab say sasta", "sabse kam"]
+        if any(w in lower_prompt for w in cheapest_words):
+            today_name_now = pk_now().strftime("%A")
+            # "available mein sasta" = sirf available barbers, warna sab
+            check_available_only = any(w in lower_prompt for w in ["available", "ag", "aaj", "abhi", "in mein", "in ma"])
+            if check_available_only:
+                available = [b for b in data["barbers"] if today_name_now.lower() not in [d.strip().lower() for d in str(b.get("off_day","")).split(",")]]
+            else:
+                available = data["barbers"]
+            cheapest_price = None
+            cheapest_info = []
+            for b in available:
+                barber_svcs = [s for s in data["services"] if s.get("barber_id") == b["id"]]
+                for s in barber_svcs:
+                    try:
+                        price = int(str(s.get("charge", 9999)).replace("Rs.","").strip())
+                        if cheapest_price is None or price < cheapest_price:
+                            cheapest_price = price
+                            cheapest_info = [(b["name"], s["service_name"], price)]
+                        elif price == cheapest_price:
+                            cheapest_info.append((b["name"], s["service_name"], price))
+                    except: pass
+            if cheapest_info:
+                lines = "\n".join(f"- {n}: {svc} Rs.{p}" for n,svc,p in cheapest_info)
+                return {"reply": f"Sabse sasta available:\n{lines}", "booking_step": 0, "booking_data": {}, "session_id": session_id}
+
         yes_words=["haan","han","yes","hna","ok","okay","bilkul"]
         is_yes=any(w in lower_prompt.split() for w in yes_words)
         last_assistant=""
         for msg in reversed(req.messages[:-1]):
             if msg.role=="assistant": last_assistant=msg.content.lower(); break
-        booking_was_asked=any(w in last_assistant for w in ["booking karwni hai","booking karna","book"])
-        if is_yes and booking_was_asked:
-            return ret("👍 Theek hai! Apna **naam** bataiye:",1,{})
+        # Booking confirm/cancel ke baad "ok/han" pe naya booking mat shuro karo
+        last_was_confirmed = any(w in last_assistant for w in ["booking confirm ho gayi", "booking cancel ho gayi", "shukriya", "booking id"])
+        booking_was_asked=any(w in last_assistant for w in ["booking karwni hai","booking karna","book"]) and not last_was_confirmed
+        info_words = ["info", "barber", "service", "timing", "price", "kitna", "kya", "kab", "kaun", "batao", "related", "chahiye info", "details", "bata", "kaise", "kon", "available", "off"]
+        is_info_request = any(w in lower_prompt for w in info_words)
+
+        if is_yes and booking_was_asked and not is_info_request:
+            # FIX: Sirf last user message se extract karo - history se nahi
+            # Pehle check karo last assistant message mein booking confirm/cancel to nahi tha
+            last_was_confirmed = any(w in last_assistant for w in ["booking confirm ho gayi", "booking cancel ho gayi", "shukriya", "booking id"])
+            if last_was_confirmed:
+                # Booking ho chuki ya cancel ho chuki - naya flow mat shuru karo
+                pass
+            else:
+                pre_booking_data = {}
+                ex = detect_intent_and_extract(prompt, barbers_list, services_list, data["today_date"], data["today_name"])
+                if ex.get("service"): pre_booking_data["service"] = ex["service"]
+                if ex.get("barber"):
+                    match = [b["name"] for b in barbers_list if ex["barber"].lower() in b["name"].lower()]
+                    if match: pre_booking_data["barber"] = match[0]
+                if ex.get("date"):
+                    pd = parse_flexible_date(ex["date"])
+                    now_pk = pk_now()
+                    if pd and pd.date() >= now_pk.date() and pd.date() <= (now_pk + timedelta(days=7)).date():
+                        pre_booking_data["date"] = pd.strftime("%d %B %Y")
+                if ex.get("time"):
+                    pt = parse_flexible_time(ex["time"])
+                    if pt: pre_booking_data["time"] = pt.strftime("%I:%M %p")
+                return ret("👍 Theek hai! Apna **naam** bataiye:", 1, pre_booking_data)
         else:
             extracted=detect_intent_and_extract(prompt,barbers_list,services_list,data["today_date"],data["today_name"])
             intent=extracted.get("intent","other")
@@ -573,7 +645,8 @@ async def chat(req: ChatRequest):
                     if match: booking_data["barber"]=match[0]
                 if extracted.get("date"):
                     pd=parse_flexible_date(extracted["date"])
-                    if pd and pd.date()>=datetime.now().date() and pd.date()<=(datetime.now()+timedelta(days=7)).date():
+                    now_pk=pk_now()
+                    if pd and pd.date()>=now_pk.date() and pd.date()<=(now_pk+timedelta(days=7)).date():
                         booking_data["date"]=pd.strftime("%d %B %Y")
                 if extracted.get("time"):
                     pt=parse_flexible_time(extracted["time"])
@@ -586,6 +659,11 @@ async def chat(req: ChatRequest):
                     msg=f"💇 **{barber_name}** ki services select karein:" if barber_name else "💇 Kaunsi service chahiye? Select karein:"
                     return ret(msg,2,booking_data,{"show_services":svc_names})
                 step,rep=_resolve_after_service(booking_data,barbers_list,services_list)
+                # FIX 3: Agar barber+date+time sab already hai to seedha confirm karo
+                if booking_data.get("barber") and booking_data.get("date") and booking_data.get("time") and step not in [2,4]:
+                    svc_display=booking_data.get("service","")
+                    rep=f"✅ Confirm karein:\n💈 Barber: **{booking_data['barber']}**\n✂️ Service: **{svc_display}**\n📅 Date: **{booking_data['date']}**\n⏰ Time: **{booking_data['time']}**\n\nSahi hai? (Haan/Nahi)"
+                    return ret(rep,7,booking_data)
                 svc_names=get_service_names(booking_data,barbers_list,services_list)
                 if step==2: return ret(rep,step,booking_data,{"show_services":svc_names})
                 return ret(rep,step,booking_data)
@@ -599,11 +677,12 @@ async def chat(req: ChatRequest):
                     try:
                         br=next((b for b in barbers_list if b["name"]==found_barber),None)
                         bid=br["id"] if br else None; tim=br.get("timing","N/A") if br else "N/A"
+                        now_pk=pk_now()
                         check_date=data["today_date"]
                         if any(w in lower_prompt for w in ["kal","kl","tomorrow","tmrw"]):
-                            check_date=(datetime.now()+timedelta(days=1)).strftime("%d %B %Y")
+                            check_date=(now_pk+timedelta(days=1)).strftime("%d %B %Y")
                         elif any(w in lower_prompt for w in ["parson","parso","prson"]):
-                            check_date=(datetime.now()+timedelta(days=2)).strftime("%d %B %Y")
+                            check_date=(now_pk+timedelta(days=2)).strftime("%d %B %Y")
                         check_dt=datetime.strptime(check_date,"%d %B %Y"); check_day=check_dt.strftime("%A")
                         barber_off=br.get("off_day","") if br else ""
                         off_list=[d.strip().lower() for d in str(barber_off).split(",") if d.strip()]
