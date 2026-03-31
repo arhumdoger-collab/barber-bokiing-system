@@ -1,6 +1,6 @@
 export async function POST(request) {
   const body = await request.json();
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  const apiUrl = process.env.BACKEND_URL || "https://arhumdoger-barbersystemm.hf.space";
   const response = await fetch(`${apiUrl}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
